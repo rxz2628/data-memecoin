@@ -1,0 +1,33 @@
+name: kumpul-memecoin
+
+on:
+  schedule:
+    - cron: "7 * * * *"        # tiap jam (menit ke-7, UTC). GitHub kadang telat beberapa menit.
+  workflow_dispatch: {}         # tombol "Run workflow" untuk jalan manual
+
+permissions:
+  contents: write               # agar bisa commit data ke repo ini
+
+concurrency:
+  group: kumpul-memecoin        # jangan ada 2 sesi bersamaan
+  cancel-in-progress: false
+
+jobs:
+  kumpul:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Kumpulkan pool baru (likuiditas >= $5.000) + unduh antrean yang sudah 6 jam
+        run: python kumpul_memecoin_1m.py --jam 0.75 --sampel 1 --liq-min 5000 --maks-menit 50 --ulang-kosong
+      - name: Simpan data ke repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add memecoin_daftar.csv memecoin_1m || true
+          git commit -m "data memecoin $(date -u +%Y-%m-%dT%H:%MZ)" || echo "tidak ada data baru"
+          git pull --rebase || true
+          git push || echo "push gagal, dicoba sesi berikutnya"
