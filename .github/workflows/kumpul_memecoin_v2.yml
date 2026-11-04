@@ -1,0 +1,46 @@
+name: kumpul-memecoin-v2
+
+on:
+  schedule:
+    - cron: "7 * * * *"        # cadangan: tiap jam (UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write               # simpan data ke repo
+  actions: write                # agar bisa menyalakan sesi berikutnya sendiri
+
+concurrency:
+  group: kumpul-memecoin        # tidak pernah 2 sesi bersamaan (juga dengan workflow lama)
+  cancel-in-progress: false
+
+jobs:
+  kumpul:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Kumpulkan pool baru (likuiditas >= $5.000) + unduh antrean yang sudah 6 jam
+        run: python kumpul_memecoin_1m.py --jam 0.75 --sampel 1 --liq-min 5000 --maks-menit 50 --ulang-kosong
+      - name: Simpan data ke repo
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add memecoin_daftar.csv memecoin_1m || true
+          git commit -m "data memecoin $(date -u +%Y-%m-%dT%H:%MZ)" || echo "tidak ada data baru"
+          git pull --rebase || true
+          git push || echo "push gagal, dicoba sesi berikutnya"
+      - name: Nyalakan sesi berikutnya (berhenti otomatis setelah tanggal batas)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BATAS: "2026-11-12"     # setelah tanggal ini rantai berhenti sendiri; ubah bila perlu
+        run: |
+          if [ "$(date -u +%F)" \< "$BATAS" ]; then
+            gh workflow run kumpul_memecoin_v2.yml --ref main && echo "sesi berikutnya dijadwalkan"
+          else
+            echo "lewat $BATAS, rantai berhenti"
+          fi
