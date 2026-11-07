@@ -73,8 +73,12 @@ def parse_new_pools(d):
     for p in (d or {}).get("data") or []:
         a = p.get("attributes") or {}
         dex = (((p.get("relationships") or {}).get("dex") or {}).get("data") or {}).get("id", "")
+        base = (((p.get("relationships") or {}).get("base_token") or {}).get("data") or {}).get("id", "")
+        m5 = ((a.get("transactions") or {}).get("m5") or {})
         out.append(dict(address=a.get("address"), name=a.get("name"), created=a.get("pool_created_at"),
-                        liq=float(a.get("reserve_in_usd") or 0), dex=dex))
+                        liq=float(a.get("reserve_in_usd") or 0), dex=dex, mint=base.split("_", 1)[-1],
+                        buys_m5=m5.get("buys"), sells_m5=m5.get("sells"),
+                        buyers_m5=m5.get("buyers"), sellers_m5=m5.get("sellers")))
     return [x for x in out if x["address"]]
 
 
@@ -89,6 +93,46 @@ def iso_to_ts(s):
         return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
     except Exception:
         return None
+
+
+RUG = os.path.join(OUT, "_meta", "rugcheck.csv")     # di subfolder agar tidak dianggap file candle
+
+
+def rugcheck(pool, mint, now):
+    """laporan keamanan RugCheck SAAT pool ditemukan (informasi yang benar-benar tersedia waktu itu)."""
+    if not mint:
+        return
+    try:
+        req = urllib.request.Request(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary", headers=HDR)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.loads(r.read())
+    except Exception:
+        return
+    os.makedirs(os.path.dirname(RUG), exist_ok=True)
+    new = not os.path.exists(RUG)
+    with open(RUG, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["address", "mint", "dicek", "token2022", "score_norm", "lp_locked_pct", "risks"])
+        w.writerow([pool, mint, int(now), int(j.get("tokenProgram") == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
+                    j.get("score_normalised"), j.get("lpLockedPct"),
+                    "|".join(f"{x.get('name')}:{x.get('level')}" for x in (j.get("risks") or []))])
+
+
+DET = os.path.join(OUT, "_meta", "deteksi.csv")      # info anti-honeypot SAAT pool ditemukan
+
+
+def catat_deteksi(p, now):
+    """mint, apakah mint berakhiran 'pump' (dibuat lewat pump.fun), dan transaksi beli/jual 5 menit terakhir."""
+    os.makedirs(os.path.dirname(DET), exist_ok=True)
+    new = not os.path.exists(DET)
+    with open(DET, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["address", "mint", "dicek", "mint_pump", "buys_m5", "sells_m5", "buyers_m5", "sellers_m5"])
+        mint = p.get("mint") or ""
+        w.writerow([p["address"], mint, int(now), int(mint.endswith("pump")), p.get("buys_m5"), p.get("sells_m5"),
+                    p.get("buyers_m5"), p.get("sellers_m5")])
 
 
 def load_seen():
@@ -127,6 +171,10 @@ def main():
                     help="hanya sampel pool dengan likuiditas awal >= nilai ini (USD), mis. 5000 untuk uji aturan yang dikunci")
     ap.add_argument("--maks-menit", type=float, default=0.0,
                     help="berhenti paksa setelah N menit walau antrean belum habis (untuk GitHub Actions)")
+    ap.add_argument("--dex", default="pumpswap",
+                    help="hanya sampel/unduh pool dari DEX ini (pisahkan koma), 'semua' = semua DEX. Default: pumpswap")
+    ap.add_argument("--tanpa-rugcheck", dest="rugcheck", action="store_false",
+                    help="matikan pengambilan laporan RugCheck (default: aktif; disimpan di memecoin_1m/_meta/rugcheck.csv)")
     ap.add_argument("--ulang-kosong", action="store_true", help="unduh ulang file yang isinya kosong (mungkin dulu gagal)")
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
@@ -139,13 +187,15 @@ def main():
         if a.ulang_kosong and os.path.getsize(f) < 60:                # hanya baris judul
             return False
         return True
-    queue = [r for r in seen.values() if r.get("sampel") == "1" and not sudah(r["address"])]
+    dexok = (lambda d: True) if a.dex == "semua" else (lambda d, s=set(a.dex.split(",")): d in s)
+    queue = [r for r in seen.values() if r.get("sampel") == "1" and dexok(r.get("dex", "")) and not sudah(r["address"])]
     n_gagal = 0
     t_end = time.time() + a.jam * 3600
     t_stop = time.time() + a.maks_menit * 60 if a.maks_menit > 0 else float("inf")
     last_list = 0
     n_dl = 0
-    print(f"  mengumpulkan {a.jam} jam di {a.jaringan}. Tercatat sebelumnya: {len(seen)} pool. Ctrl+C untuk berhenti.")
+    print(f"  mengumpulkan {a.jam} jam di {a.jaringan} | DEX: {a.dex} | antre awal {len(queue)}. "
+          f"Tercatat sebelumnya: {len(seen)} pool. Ctrl+C untuk berhenti.")
     try:
         while time.time() < t_end or queue:
             now = time.time()
@@ -160,7 +210,7 @@ def main():
                     for p in parse_new_pools(d):
                         if p["address"] in seen:
                             continue
-                        s = "1" if (random.random() < a.sampel and p["liq"] >= a.liq_min) else "0"
+                        s = "1" if (random.random() < a.sampel and p["liq"] >= a.liq_min and dexok(p["dex"])) else "0"
                         r = dict(address=p["address"], name=p["name"], created=p["created"], liq_awal=p["liq"],
                                  dex=p["dex"], dicatat=int(now), sampel=s)
                         seen[p["address"]] = r
@@ -168,6 +218,10 @@ def main():
                         added += 1
                         if s == "1":
                             queue.append(r)
+                            catat_deteksi(p, time.time())
+                            if a.rugcheck:
+                                rugcheck(p["address"], p.get("mint"), time.time())
+                                time.sleep(0.3)
                 last_list = now
                 print(f"  [{time.strftime('%H:%M')}] +{added} pool baru | total {len(seen)} | antre unduh {len(queue)} "
                       f"| sudah diunduh {n_dl}", flush=True)
