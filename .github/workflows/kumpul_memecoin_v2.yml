@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Kumpulkan pool baru (likuiditas >= $5.000) + unduh antrean yang sudah 6 jam
-        run: python kumpul_memecoin_1m.py --jam 0.75 --sampel 1 --liq-min 5000 --maks-menit 50 --ulang-kosong
+        run: python kumpul_memecoin_1m.py --jam 0.75 --sampel 1 --liq-min 0 --maks-menit 50 --ulang-kosong
       - name: Simpan data ke repo
         if: always()
         run: |
