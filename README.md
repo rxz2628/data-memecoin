@@ -1,2 +1,2 @@
 # data-memecoin
-Pengumpul data memecoin Solana (GeckoTerminal) untuk skripsi - GitHub Actions
+Pengumpul data memecoin Solana (GeckoTerminal) - GitHub Actions
