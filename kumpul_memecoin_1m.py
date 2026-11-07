@@ -193,7 +193,7 @@ def main():
     semua = a.liq_min <= 0
     queue = [r for r in seen.values() if (r.get("sampel") == "1" or semua) and dexok(r.get("dex", ""))
              and not sudah(r["address"])]
-    queue.sort(key=lambda r: (r.get("sampel") != "1", r.get("created", "")))   # yang lama-terlewat diunduh setelahnya
+    # urutan unduh: yang paling baru (sudah berumur 6 jam) dulu, sisa antrean lama diunduh saat sepi
     n_gagal = 0
     t_end = time.time() + a.jam * 3600
     t_stop = time.time() + a.maks_menit * 60 if a.maks_menit > 0 else float("inf")
@@ -238,7 +238,7 @@ def main():
                 else:
                     time.sleep(5)
                 continue
-            r = ready[0]
+            r = max(ready, key=lambda q: q.get("created", ""))   # TERBARU dulu: data hari ini cepat tersedia
             queue.remove(r)
             ts = iso_to_ts(r["created"])
             rows = fetch_candles(a.jaringan, r["address"], ts) if ts else []
