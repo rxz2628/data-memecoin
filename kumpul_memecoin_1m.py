@@ -188,7 +188,12 @@ def main():
             return False
         return True
     dexok = (lambda d: True) if a.dex == "semua" else (lambda d, s=set(a.dex.split(",")): d in s)
-    queue = [r for r in seen.values() if r.get("sampel") == "1" and dexok(r.get("dex", "")) and not sudah(r["address"])]
+    # liq-min 0 = ambil SEMUA pool DEX terpilih, termasuk yang dulu dilewati karena likuiditas rendah saat ditemukan
+    # (filter likuiditas saat ditemukan ~2 menit setelah migrasi membocorkan info "token sudah ambruk").
+    semua = a.liq_min <= 0
+    queue = [r for r in seen.values() if (r.get("sampel") == "1" or semua) and dexok(r.get("dex", ""))
+             and not sudah(r["address"])]
+    queue.sort(key=lambda r: (r.get("sampel") != "1", r.get("created", "")))   # yang lama-terlewat diunduh setelahnya
     n_gagal = 0
     t_end = time.time() + a.jam * 3600
     t_stop = time.time() + a.maks_menit * 60 if a.maks_menit > 0 else float("inf")
