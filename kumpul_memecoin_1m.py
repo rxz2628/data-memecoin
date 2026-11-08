@@ -131,8 +131,97 @@ def catat_deteksi(p, now):
         if new:
             w.writerow(["address", "mint", "dicek", "mint_pump", "buys_m5", "sells_m5", "buyers_m5", "sellers_m5"])
         mint = p.get("mint") or ""
+        MINT[p["address"]] = mint
         w.writerow([p["address"], mint, int(now), int(mint.endswith("pump")), p.get("buys_m5"), p.get("sells_m5"),
                     p.get("buyers_m5"), p.get("sellers_m5")])
+
+
+MINT = {}                                            # address pool -> mint (dari deteksi.csv)
+
+
+def load_mint():
+    if os.path.exists(DET):
+        with open(DET, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                MINT[r["address"]] = r.get("mint", "")
+
+
+TRX = os.path.join(OUT, "_meta", "transaksi_awal.csv")   # buy/sell volume awal (diambil SAAT ditemukan)
+TRX_KOLOM = ["address", "mint", "dicek", "created_ts", "n_trade", "trade_tertua_s", "lengkap"]
+for _w in (60, 120):
+    TRX_KOLOM += [f"{k}_{_w}s" for k in ("buys", "sells", "buy_usd", "sell_usd", "buyers", "sellers",
+                                         "max_sell_usd", "top3_sell_pct", "mean_buy_usd")]
+
+
+def ringkas_trade(tr, t0, w):
+    x = [t for t in tr if t0 - 60 <= t["ts"] <= t0 + w]
+    b = [t for t in x if t["kind"] == "buy"]
+    s_ = [t for t in x if t["kind"] == "sell"]
+    sell_by = {}
+    for t in s_:
+        sell_by[t["from"]] = sell_by.get(t["from"], 0.0) + t["usd"]
+    tot_s = sum(t["usd"] for t in s_)
+    top3 = sum(sorted(sell_by.values(), reverse=True)[:3])
+    return [len(b), len(s_), round(sum(t["usd"] for t in b), 2), round(tot_s, 2),
+            len({t["from"] for t in b}), len(sell_by), round(max([t["usd"] for t in s_], default=0), 2),
+            round(100 * top3 / tot_s, 1) if tot_s > 0 else "",
+            round(sum(t["usd"] for t in b) / len(b), 2) if b else ""]
+
+
+def transaksi_awal(net, pool, mint, created_ts, now):
+    """300 transaksi terakhir pool (GeckoTerminal) -> ringkasan beli/jual 60 & 120 detik pertama.
+    Diambil saat ditemukan (~2 menit setelah migrasi) karena API hanya menyimpan 300 transaksi terakhir."""
+    d = get(f"{API}/networks/{net}/pools/{pool}/trades")
+    if d is GAGAL or not d:
+        return
+    tr = []
+    for x in d.get("data") or []:
+        a = x.get("attributes") or {}
+        if a.get("is_anomalous"):
+            continue
+        ts = iso_to_ts(a.get("block_timestamp") or "")
+        if ts is None:
+            continue
+        tr.append(dict(ts=ts, kind=a.get("kind"), usd=float(a.get("volume_in_usd") or 0), **{"from": a.get("tx_from_address")}))
+    if not tr:
+        return
+    tertua = min(t["ts"] for t in tr)
+    row = [pool, mint, int(now), created_ts, len(tr), tertua - created_ts, int(len(tr) < 300 or tertua <= created_ts)]
+    for w in (60, 120):
+        row += ringkas_trade(tr, created_ts, w)
+    os.makedirs(os.path.dirname(TRX), exist_ok=True)
+    new = not os.path.exists(TRX)
+    with open(TRX, "a", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        if new:
+            wr.writerow(TRX_KOLOM)
+        wr.writerow(row)
+
+
+PROF = os.path.join(OUT, "_meta", "profile.csv")     # profile DexScreener + WAKTU bayarnya (cegah bocor masa depan)
+
+
+def profile_dex(pool, mint, now):
+    if not mint:
+        return
+    try:
+        req = urllib.request.Request(f"https://api.dexscreener.com/orders/v1/solana/{mint}", headers=HDR)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.loads(r.read())
+    except Exception:
+        return
+    od = [o for o in (j.get("orders") or []) if o.get("type") == "tokenProfile"]
+    bs = j.get("boosts") or []
+    pay = min([o.get("paymentTimestamp") or 0 for o in od], default=0)
+    os.makedirs(os.path.dirname(PROF), exist_ok=True)
+    new = not os.path.exists(PROF)
+    with open(PROF, "a", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        if new:
+            wr.writerow(["address", "mint", "dicek", "ada_profile", "profile_bayar_ts", "status", "n_boost", "boost_pertama_ts"])
+        wr.writerow([pool, mint, int(now), int(bool(od)), int(pay / 1000) if pay else "",
+                     od[0].get("status", "") if od else "", len(bs),
+                     int(min([b.get("paymentTimestamp") or 0 for b in bs]) / 1000) if bs and any(b.get("paymentTimestamp") for b in bs) else ""])
 
 
 def load_seen():
@@ -175,10 +264,13 @@ def main():
                     help="hanya sampel/unduh pool dari DEX ini (pisahkan koma), 'semua' = semua DEX. Default: pumpswap")
     ap.add_argument("--tanpa-rugcheck", dest="rugcheck", action="store_false",
                     help="matikan pengambilan laporan RugCheck (default: aktif; disimpan di memecoin_1m/_meta/rugcheck.csv)")
+    ap.add_argument("--tanpa-ekstra", dest="ekstra", action="store_false",
+                    help="matikan pencatatan tambahan (transaksi_awal.csv & profile.csv); default: aktif")
     ap.add_argument("--ulang-kosong", action="store_true", help="unduh ulang file yang isinya kosong (mungkin dulu gagal)")
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     seen = load_seen()
+    load_mint()
 
     def sudah(addr):
         f = os.path.join(OUT, addr + ".csv")
@@ -224,6 +316,10 @@ def main():
                         if s == "1":
                             queue.append(r)
                             catat_deteksi(p, time.time())
+                            if a.ekstra and (p.get("mint") or "").endswith("pump"):
+                                transaksi_awal(a.jaringan, p["address"], p.get("mint"), iso_to_ts(p["created"] or ""),
+                                               time.time())
+                                time.sleep(JEDA["s"])
                             if a.rugcheck:
                                 rugcheck(p["address"], p.get("mint"), time.time())
                                 time.sleep(0.3)
@@ -252,6 +348,9 @@ def main():
                 w.writerow(["timestamp", "open", "high", "low", "close", "volume"])
                 w.writerows(rows)
             n_dl += 1
+            if a.ekstra and MINT.get(r["address"], "").endswith("pump"):
+                profile_dex(r["address"], MINT[r["address"]], time.time())
+                time.sleep(0.5)
             if n_dl % 10 == 0 or not queue:
                 print(f"  [{time.strftime('%H:%M')}] diunduh {n_dl} | sisa antre {len(queue)} | gagal (diulang) {n_gagal} "
                       f"| jeda {JEDA['s']:.1f} dtk | perkiraan sisa ~{len(queue) * (JEDA['s'] + 0.5) / 60:.0f} menit", flush=True)
@@ -268,6 +367,13 @@ def selftest():
     o = {"data": {"attributes": {"ohlcv_list": [[120, 1, 2, 0.5, 1.5, 10], [60, 1, 1, 1, 1, 5]]}}}
     assert parse_ohlcv(o)[0][0] == 60
     assert iso_to_ts("2026-11-03T10:00:00Z") is not None
+    tr = [dict(ts=100, kind="buy", usd=10, **{"from": "A"}), dict(ts=130, kind="sell", usd=30, **{"from": "D"}),
+          dict(ts=150, kind="buy", usd=20, **{"from": "B"}), dict(ts=170, kind="sell", usd=10, **{"from": "C"}),
+          dict(ts=400, kind="sell", usd=99, **{"from": "D"})]
+    r60 = ringkas_trade(tr, 100, 60)
+    assert r60[:4] == [2, 1, 30, 30] and r60[6] == 30 and r60[7] == 100.0, r60
+    r120 = ringkas_trade(tr, 100, 120)
+    assert r120[1] == 2 and r120[3] == 40 and r120[5] == 2 and len(TRX_KOLOM) == 7 + 18
     print("SELFTEST kumpul_memecoin_1m OK")
 
 
