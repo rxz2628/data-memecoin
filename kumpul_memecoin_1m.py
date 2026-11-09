@@ -182,9 +182,12 @@ def transaksi_awal(net, pool, mint, created_ts, now):
         ts = iso_to_ts(a.get("block_timestamp") or "")
         if ts is None:
             continue
-        tr.append(dict(ts=ts, kind=a.get("kind"), usd=float(a.get("volume_in_usd") or 0), **{"from": a.get("tx_from_address")}))
+        tr.append(dict(ts=ts, kind=a.get("kind"), usd=float(a.get("volume_in_usd") or 0), **{"from": a.get("tx_from_address")},
+                       tx=a.get("tx_hash") or "", blok=a.get("block_number") or "",
+                       amt_from=a.get("from_token_amount") or "", amt_to=a.get("to_token_amount") or ""))
     if not tr:
         return
+    simpan_trx_mentah(pool, mint, created_ts, tr)
     tertua = min(t["ts"] for t in tr)
     row = [pool, mint, int(now), created_ts, len(tr), tertua - created_ts, int(len(tr) < 300 or tertua <= created_ts)]
     for w in (60, 120):
@@ -196,6 +199,27 @@ def transaksi_awal(net, pool, mint, created_ts, now):
         if new:
             wr.writerow(TRX_KOLOM)
         wr.writerow(row)
+
+
+TRXM = os.path.join(OUT, "_meta", "trx_mentah.csv")   # SETIAP transaksi 3 menit pertama (untuk analisis siapa menjual sebelum beli)
+TRXM_KOLOM = ["address", "mint", "created_ts", "ts", "blok", "kind", "usd", "dompet", "token_from", "token_to", "tx"]
+
+
+def simpan_trx_mentah(pool, mint, created_ts, tr):
+    if created_ts is None:
+        return
+    x = sorted((t for t in tr if created_ts - 60 <= t["ts"] <= created_ts + 180), key=lambda t: (t["ts"], str(t["blok"])))
+    if not x:
+        return
+    os.makedirs(os.path.dirname(TRXM), exist_ok=True)
+    new = not os.path.exists(TRXM)
+    with open(TRXM, "a", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        if new:
+            wr.writerow(TRXM_KOLOM)
+        for t in x:
+            wr.writerow([pool, mint or "", created_ts, t["ts"], t["blok"], t["kind"], round(t["usd"], 2), t["from"] or "",
+                         t["amt_from"], t["amt_to"], t["tx"]])
 
 
 PROF = os.path.join(OUT, "_meta", "profile.csv")     # profile DexScreener + WAKTU bayarnya (cegah bocor masa depan)
@@ -374,6 +398,15 @@ def selftest():
     assert r60[:4] == [2, 1, 30, 30] and r60[6] == 30 and r60[7] == 100.0, r60
     r120 = ringkas_trade(tr, 100, 120)
     assert r120[1] == 2 and r120[3] == 40 and r120[5] == 2 and len(TRX_KOLOM) == 7 + 18
+    import tempfile
+    global TRXM
+    asli, TRXM = TRXM, os.path.join(tempfile.mkdtemp(), "trx_mentah.csv")
+    tr2 = [dict(t, tx="h%d" % i, blok=i, amt_from=1, amt_to=2) for i, t in enumerate(tr)]
+    simpan_trx_mentah("P", "Mpump", 100, tr2)
+    with open(TRXM, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 4 and rows[0]["dompet"] == "A" and rows[-1]["ts"] == "170", rows   # ts=400 di luar 3 menit
+    TRXM = asli
     print("SELFTEST kumpul_memecoin_1m OK")
 
 
