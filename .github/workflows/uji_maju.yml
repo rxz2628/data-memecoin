@@ -1,0 +1,54 @@
+name: uji-maju-kecil-likuid
+
+# Uji maju KERTAS (tanpa uang asli) aturan "kecil tapi likuid". Hanya membaca API publik.
+on:
+  schedule:
+    - cron: "37 * * * *"        # cadangan tiap jam (UTC) bila rantai putus
+  workflow_dispatch: {}
+
+permissions:
+  contents: write               # simpan hasil ke repo
+  actions: write                # menyalakan sesi berikutnya sendiri
+
+concurrency:
+  group: uji-maju               # terpisah dari pengumpul lama, tidak pernah 2 sesi uji-maju bersamaan
+  cancel-in-progress: false
+
+jobs:
+  uji:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Uji logika
+        run: python uji_maju.py --selftest
+      - name: Pantau 52 menit (cek tiap 30 detik)
+        env:
+          # "tidak" = saat dompet $10 habis, dompet berhenti trading tapi pencatatan statistik tetap jalan
+          # "ya"    = saat dompet habis dan tidak ada posisi terbuka, semua berhenti total
+          BERHENTI_TOTAL: "tidak"
+        run: python uji_maju.py --menit 52
+      - name: Simpan hasil ke repo
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uji_maju || true
+          git commit -m "uji maju $(date -u +%Y-%m-%dT%H:%MZ)" || echo "tidak ada data baru"
+          for i in 1 2 3; do git pull --rebase && git push && break || sleep 5; done
+      - name: Nyalakan sesi berikutnya (berhenti otomatis setelah tanggal batas)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BATAS: "2026-12-22"     # uji maju 1 bulan; ubah bila perlu
+        run: |
+          if [ -f uji_maju/BERHENTI.txt ]; then
+            echo "dompet habis, rantai berhenti"
+          elif [ "$(date -u +%F)" \< "$BATAS" ]; then
+            gh workflow run uji_maju.yml --ref "${GITHUB_REF_NAME}" && echo "sesi berikutnya dijadwalkan"
+          else
+            echo "lewat $BATAS, rantai berhenti"
+          fi
