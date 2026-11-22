@@ -14,6 +14,14 @@ Aturan (DIKUNCI 22 Nov 2026, lihat aturan_kunci_corpus.txt):
   Pembanding acak: untuk setiap token lolos, 1 token likuid (>= $13k) seumur yang TIDAK lolos dipilih acak dan
              dicatat dengan aturan keluar yang sama (uji placebo live).
 
+Versi 2 (22 Nov 2026) -- perbaikan PENGUKURAN, aturan masuk tidak berubah:
+  1. Populasi hanya token lulusan pump.fun (alamat mint berakhiran "pump"), untuk pilihan DAN pembanding.
+  2. Likuiditas $0 dari DexScreener (data belum terisi) -> tunggu pengecekan berikutnya dalam jendela 3-5 menit.
+  3. Hasil jual dihitung dengan rumus pool x*y=k dari likuiditas saat itu (dampak harga), jadi pool kosong
+     tidak bisa menghasilkan untung palsu. Harga di pool < $1.000 likuiditas tidak dipakai untuk TP/puncak.
+  4. Penutupan 24 jam ditunda maks 5 menit bila likuiditas terbaca $0 (bisa data sesaat hilang).
+  Hasil versi 1 (ada bug harga pool kosong) dipindah ke uji_maju/arsip_v1/.
+
 Pakai:
   python uji_maju.py --menit 55          (loop 55 menit, cek tiap 30 detik)
   python uji_maju.py --ringkas            (cetak hasil sementara)
@@ -60,13 +68,41 @@ def dompet_baru():
     return {"modal": A["modal"], "kas": A["modal"], "trade": 0, "ditolak_kas": 0, "berhenti": False, "berhenti_ts": None}
 
 
+VERSI = 2
+LIQ_SAH = 1000      # di bawah ini harga pool tidak dipercaya (pool kosong/rug)
+
+
 def muat_state():
-    st = {"pool": {}, "posisi": {}, "tutup": []}
+    st = {"pool": {}, "posisi": {}, "tutup": [], "versi": VERSI}
     if os.path.exists(F_STATE):
         with open(F_STATE) as f:
-            st = json.load(f)
+            lama = json.load(f)
+        if lama.get("versi") == VERSI:
+            st = lama
+        else:
+            # hasil versi lama memakai harga pool kosong -> arsipkan, mulai bersih dengan versi baru
+            arsip = os.path.join(DIR, f"arsip_v{lama.get('versi', 1)}")
+            os.makedirs(arsip, exist_ok=True)
+            for fp in (F_STATE, F_POS, F_LOG):
+                if os.path.exists(fp):
+                    os.replace(fp, os.path.join(arsip, os.path.basename(fp)))
     st.setdefault("dompet", {"pilihan": dompet_baru(), "acak": dompet_baru()})
+    st["versi"] = VERSI
     return st
+
+
+def jual_usd(token, harga, liq):
+    """Hasil jual `token` ke pool x*y=k. Sisi SOL pool ~ liq/2 (USD). Setelah fee & biaya tetap; min 0."""
+    if harga <= 0 or liq < LIQ_SAH or token <= 0:
+        return 0.0
+    q = liq / 2.0                 # cadangan sisi SOL (USD)
+    t = q / harga                 # cadangan token
+    kotor = q * token / (t + token)
+    return max(0.0, kotor * (1 - A["fee"]) - A["tetap"])
+
+
+def mint_pumpfun(mint):
+    return bool(mint) and mint.endswith("pump")
 
 
 def dompet_ambil(st, jenis, now):
@@ -230,23 +266,31 @@ def kelola(st, pos, x, now):
             pos["_token"] = A["per_trade"] * (1 - A["fee"]) / h      # token yang didapat setelah fee beli
         return
     pe = float(pos["harga_masuk"])
-    if h > 0:
+    liq = x["liq"] if x else 0.0
+    sah = h > 0 and liq >= LIQ_SAH                     # harga dari pool yang masih berisi
+    tok = pos.get("_token") or A["per_trade"] * (1 - A["fee"]) / pe
+    if sah:
         pos["puncak_x"] = round(max(float(pos["puncak_x"]), h / pe), 3)
-        if x["liq"] < 1000:
-            pos["catatan"] = "likuiditas habis"
-    if pos["status"] == "terbuka" and h >= A["tp"] * pe:
+        pos["_liq"] = liq
+    elif h > 0 and 0 < liq < LIQ_SAH:
+        pos["catatan"] = "likuiditas habis"
+    if pos["status"] == "terbuka" and sah and h >= A["tp"] * pe:
         pos["status"] = "tunggu_jual50"
-    elif pos["status"] == "tunggu_jual50" and h > 0:
-        pos["harga_jual50"] = h; pos["jual50_ts"] = int(now); pos["status"] = "sisa50"
-        tok = pos.get("_token") or A["per_trade"] * (1 - A["fee"]) / pe
-        dompet_terima(st, pos, A["porsi"] * tok * h * (1 - A["fee"]) - A["tetap"])
-    if now - pos["masuk_ts"] >= A["tahan_s"] or (x is None and now - pos["masuk_ts"] > 3600 and pos.get("_hilang", 0) > 20):
+    elif pos["status"] == "tunggu_jual50":
+        if sah:
+            pos["harga_jual50"] = h; pos["jual50_ts"] = int(now); pos["status"] = "sisa50"
+            dompet_terima(st, pos, jual_usd(A["porsi"] * tok, h, liq))
+        elif h > 0 and 0 < liq < LIQ_SAH:
+            pos["status"] = "terbuka"                    # pool kosong sebelum sempat jual: batal
+    habis_waktu = now - pos["masuk_ts"] >= A["tahan_s"]
+    hilang = x is None and now - pos["masuk_ts"] > 3600 and pos.get("_hilang", 0) > 20
+    if habis_waktu and not hilang and h > 0 and liq <= 0 and pos.get("_tunda", 0) < 10:
+        pos["_tunda"] = pos.get("_tunda", 0) + 1          # likuiditas terbaca $0: tunggu maks 10 cek (~5 mnt)
+        habis_waktu = False
+    if habis_waktu or hilang:
         akhir = h if h > 0 else float(pos.get("_terakhir") or 0)
-        tok = pos.get("_token") or A["per_trade"] * (1 - A["fee"]) / pe
         sisa = tok * ((1 - A["porsi"]) if pos["harga_jual50"] else 1.0)
-        nilai = sisa * akhir * (1 - A["fee"]) - A["tetap"]
-        if pos.get("catatan") == "likuiditas habis" or nilai <= 0:
-            nilai = 0.0                                              # tidak layak dijual: sisa dianggap nol
+        nilai = jual_usd(sisa, akhir, liq) if (h > 0 and not hilang) else 0.0
         dompet_terima(st, pos, nilai)
         hasil = float(pos["keluar_usd"]) - A["per_trade"] - A["tetap"]
         pos.update(harga_tutup=akhir, tutup_ts=int(now), hasil_usd=round(hasil, 4), hasil_bersih=round(hasil / A["per_trade"], 4),
@@ -263,7 +307,7 @@ def satu_putaran(st, now, sumber):
     # 1) pool baru
     if now - st.get("_list_ts", 0) >= 60:
         for pair, mint, lahir in sumber["pool_baru"]():
-            if pair and pair not in st["pool"] and now - lahir < 300:
+            if pair and pair not in st["pool"] and now - lahir < 300 and mint_pumpfun(mint):
                 st["pool"][pair] = dict(mint=mint, lahir=lahir, harga_awal=None, dinilai=False)
         st["_list_ts"] = now
     # 2) angka semua pool aktif + posisi
@@ -280,6 +324,8 @@ def satu_putaran(st, now, sumber):
             v["harga_awal"] = x["harga"]
         umur = now - v["lahir"]
         if A["umur_min"] <= umur <= A["umur_max"]:
+            if x["liq"] <= 0 and umur + 30 <= A["umur_max"]:
+                continue                                  # DexScreener belum isi likuiditas: tunggu cek berikutnya
             v["dinilai"] = True
             alasan, naik = nilai_angka(x, v["harga_awal"])
             dev = tir = None
@@ -298,7 +344,8 @@ def satu_putaran(st, now, sumber):
         buka(st, "pilihan", pair, v["mint"], x, naik, dev, tir, now)
         if dev is None: st["posisi"][f"pilihan:{pair}"]["catatan"] = "dev tidak bisa dicek"
         calon = [p for p, w in st["pool"].items() if w.get("dinilai") and w.get("alasan") and p != pair
-                 and w["x"]["liq"] >= A["liq_min"] and f"acak:{p}" not in st["posisi"] and now - w["lahir"] <= 900]
+                 and w["x"]["liq"] >= A["liq_min"] and mint_pumpfun(w["mint"])
+                 and f"acak:{p}" not in st["posisi"] and now - w["lahir"] <= 900]
         if calon:
             pa = random.choice(calon); w = st["pool"][pa]
             buka(st, "acak", pa, w["mint"], w["x"], w["naik"], None, None, now)
@@ -350,11 +397,24 @@ def selftest():
     r = {x["jenis"]: x for x in st["tutup"]}
     assert r["pilihan"]["harga_jual50"] == 2.5, r
     f, c = A["fee"], A["tetap"]; tok = (1 - f) / 1.0
-    exp = (0.5 * tok * 2.5 * (1 - f) - c) + (0.5 * tok * 1.2 * (1 - f) - c) - 1 - c
+    exp = jual_usd(0.5 * tok, 2.5, 18000) + jual_usd(0.5 * tok, 1.2, 18000) - 1 - c
     assert abs(r["pilihan"]["hasil_usd"] - round(exp, 4)) < 1e-4, (r["pilihan"]["hasil_usd"], exp)
-    expa = (tok * 0.5 * (1 - f) - c) - 1 - c
+    expa = jual_usd(tok, 0.5, 40000) - 1 - c
     assert abs(r["acak"]["hasil_usd"] - round(expa, 4)) < 1e-4, (r["acak"]["hasil_usd"], expa)
     d = st["dompet"]["pilihan"]; assert abs(d["kas"] - (10 + exp)) < 1e-3, d
+    # bug v1: pool kosong (likuiditas $500) dengan harga 1000x TIDAK boleh menghasilkan untung
+    st3 = muat_state(); st3["posisi"] = {}
+    buka(st3, "pilihan", "PX", "MXpump", dict(simbol="X", liq=18000, mcap=50000, v24=1, v5=1, b5=1, s5=1), 0.0, 0, 0, t0)
+    p = st3["posisi"]["pilihan:PX"]; kas0 = st3["dompet"]["pilihan"]["kas"]
+    kelola(st3, p, dict(harga=1.0, liq=18000), t0 + 30)
+    for k in range(5): kelola(st3, p, dict(harga=1000.0, liq=500), t0 + 60 + 30 * k)
+    assert p["status"] == "terbuka" and p["puncak_x"] == 1.0 and st3["dompet"]["pilihan"]["kas"] == kas0, p
+    kelola(st3, p, dict(harga=1000.0, liq=500), t0 + 25 * 3600)
+    assert p["status"] == "tutup" and p["hasil_usd"] == round(-1 - c, 4), p
+    # pool tipis: jual tidak bisa melebihi isi sisi SOL
+    assert jual_usd(1e9, 1.0, 2000) < 1000
+    # likuiditas $0 saat dinilai -> ditunda, bukan langsung ditolak
+    assert mint_pumpfun("Abcpump") and not mint_pumpfun("Az4GcQrR2dpMfQrEH6EG5Ks3p2VmGbJKBrcJkwHHpDN9")
     # uji modal habis: dompet dengan kas kecil harus berhenti dan menolak trade baru
     st2 = muat_state(); st2["dompet"]["pilihan"]["kas"] = 0.5
     assert dompet_ambil(st2, "pilihan", t0) is False and st2["dompet"]["pilihan"]["berhenti"] is True
